@@ -1,6 +1,6 @@
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -8,6 +8,7 @@ import yfinance as yf
 from openai import OpenAI
 
 DB_PATH = "portfolio.db"
+CURRENCIES = ["USD", "EUR", "CZK"]
 
 
 def init_db():
@@ -20,20 +21,43 @@ def init_db():
             ticker TEXT NOT NULL,
             shares REAL NOT NULL,
             purchase_price REAL,
+            purchase_currency TEXT NOT NULL DEFAULT 'USD',
+            purchase_date TEXT,
+            purchase_fx_to_usd REAL,
             created_at TEXT NOT NULL
         )
         """
     )
+    cur.execute("PRAGMA table_info(portfolio)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    if "purchase_currency" not in existing_cols:
+        cur.execute("ALTER TABLE portfolio ADD COLUMN purchase_currency TEXT NOT NULL DEFAULT 'USD'")
+    if "purchase_date" not in existing_cols:
+        cur.execute("ALTER TABLE portfolio ADD COLUMN purchase_date TEXT")
+    if "purchase_fx_to_usd" not in existing_cols:
+        cur.execute("ALTER TABLE portfolio ADD COLUMN purchase_fx_to_usd REAL")
     conn.commit()
     conn.close()
 
 
-def add_position(ticker, shares, purchase_price):
+def add_position(ticker, shares, purchase_price, purchase_currency, purchase_date, purchase_fx_to_usd):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO portfolio (ticker, shares, purchase_price, created_at) VALUES (?, ?, ?, ?)",
-        (ticker.upper(), shares, purchase_price, datetime.utcnow().isoformat()),
+        """
+        INSERT INTO portfolio (
+            ticker, shares, purchase_price, purchase_currency, purchase_date, purchase_fx_to_usd, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            ticker.upper(),
+            shares,
+            purchase_price,
+            purchase_currency,
+            purchase_date,
+            purchase_fx_to_usd,
+            datetime.utcnow().isoformat(),
+        ),
     )
     conn.commit()
     conn.close()
@@ -41,9 +65,36 @@ def add_position(ticker, shares, purchase_price):
 
 def get_portfolio():
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT ticker, shares, purchase_price, created_at FROM portfolio", conn)
+    df = pd.read_sql_query(
+        """
+        SELECT ticker, shares, purchase_price, purchase_currency, purchase_date, purchase_fx_to_usd, created_at
+        FROM portfolio
+        """,
+        conn,
+    )
     conn.close()
     return df
+
+
+def fetch_fx_rate(base_currency, quote_currency, at_date=None):
+    if base_currency == quote_currency:
+        return 1.0
+
+    pair = f"{base_currency}{quote_currency}=X"
+    fx_ticker = yf.Ticker(pair)
+
+    if at_date:
+        start_date = datetime.fromisoformat(at_date)
+        end_date = start_date + timedelta(days=7)
+        hist = fx_ticker.history(start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"))
+        if not hist.empty:
+            return float(hist["Close"].iloc[0])
+
+    recent = fx_ticker.history(period="5d")
+    if not recent.empty:
+        return float(recent["Close"].iloc[-1])
+
+    return None
 
 
 def fetch_stock_snapshot(ticker):
@@ -63,6 +114,7 @@ def fetch_stock_snapshot(ticker):
         "debt_to_equity": info.get("debtToEquity"),
         "analyst_recommendation": rec,
         "current_price": info.get("currentPrice") or info.get("regularMarketPrice"),
+        "stock_currency": info.get("currency") or "USD",
     }
 
     news_items = []
@@ -121,6 +173,13 @@ def format_number(value, pct=False):
     return str(value)
 
 
+def format_currency(value, currency):
+    symbols = {"USD": "$", "EUR": "€", "CZK": "Kč"}
+    if value is None:
+        return "N/A"
+    return f"{symbols.get(currency, '')}{value:,.2f} {currency}"
+
+
 def main():
     st.set_page_config(page_title="Portfolio Analyzer", layout="wide")
     st.title("📊 Personal Stock Portfolio Analyzer")
@@ -131,11 +190,27 @@ def main():
     ticker_input = st.sidebar.text_input("Ticker", placeholder="AAPL")
     shares_input = st.sidebar.number_input("Shares", min_value=0.0, value=1.0, step=1.0)
     purchase_price_input = st.sidebar.number_input("Purchase Price", min_value=0.0, value=0.0, step=1.0)
+    purchase_currency_input = st.sidebar.selectbox("Purchase Currency", CURRENCIES, index=0)
+    purchase_date_input = st.sidebar.date_input("Purchase Date")
 
     if st.sidebar.button("Add Position"):
         if ticker_input.strip():
-            add_position(ticker_input.strip(), shares_input, purchase_price_input)
-            st.sidebar.success(f"Added {ticker_input.upper()} to portfolio")
+            purchase_date_str = purchase_date_input.strftime("%Y-%m-%d")
+            hist_fx = fetch_fx_rate(purchase_currency_input, "USD", at_date=purchase_date_str)
+            if hist_fx is None:
+                st.sidebar.error("Could not fetch historical FX rate for purchase date.")
+            else:
+                add_position(
+                    ticker_input.strip(),
+                    shares_input,
+                    purchase_price_input,
+                    purchase_currency_input,
+                    purchase_date_str,
+                    hist_fx,
+                )
+                st.sidebar.success(
+                    f"Added {ticker_input.upper()} with historical FX ({purchase_currency_input}->USD): {hist_fx:.4f}"
+                )
         else:
             st.sidebar.error("Please enter a ticker")
 
@@ -166,26 +241,80 @@ def main():
                     "debt_to_equity": None,
                     "analyst_recommendation": "N/A",
                     "current_price": None,
+                    "stock_currency": "USD",
                 }
                 news_by_ticker[ticker] = []
+
+    display_currency = st.selectbox("Display Currency", CURRENCIES, index=0)
+    usd_to_display = fetch_fx_rate("USD", display_currency)
+    if usd_to_display is None:
+        st.warning("Could not fetch current FX for display currency. Falling back to USD.")
+        display_currency = "USD"
+        usd_to_display = 1.0
 
     portfolio_df["current_price"] = portfolio_df["ticker"].map(
         lambda t: snapshots.get(t, {}).get("current_price")
     )
-    portfolio_df["position_value"] = portfolio_df["shares"] * portfolio_df["current_price"].fillna(0)
+    portfolio_df["stock_currency"] = portfolio_df["ticker"].map(
+        lambda t: snapshots.get(t, {}).get("stock_currency", "USD")
+    )
+
+    portfolio_df["original_cost_local"] = portfolio_df["shares"] * portfolio_df["purchase_price"].fillna(0)
+    portfolio_df["original_cost_usd"] = (
+        portfolio_df["original_cost_local"] * portfolio_df["purchase_fx_to_usd"].fillna(1.0)
+    )
+    portfolio_df["original_cost_display"] = portfolio_df["original_cost_usd"] * usd_to_display
+
+    portfolio_df["stock_to_usd_now"] = portfolio_df["stock_currency"].map(
+        lambda c: fetch_fx_rate(c, "USD") or 1.0
+    )
+    portfolio_df["current_value_usd"] = (
+        portfolio_df["shares"] * portfolio_df["current_price"].fillna(0) * portfolio_df["stock_to_usd_now"]
+    )
+    portfolio_df["current_value_display"] = portfolio_df["current_value_usd"] * usd_to_display
+    portfolio_df["unrealized_gain_loss"] = (
+        portfolio_df["current_value_display"] - portfolio_df["original_cost_display"]
+    )
+    portfolio_df["unrealized_gain_loss_pct"] = portfolio_df["unrealized_gain_loss"] / portfolio_df[
+        "original_cost_display"
+    ].replace(0, pd.NA)
 
     st.subheader("Portfolio Table")
-    st.dataframe(portfolio_df, use_container_width=True)
+    table_cols = [
+        "ticker",
+        "shares",
+        "purchase_price",
+        "purchase_currency",
+        "purchase_date",
+        "current_price",
+        "stock_currency",
+        "original_cost_display",
+        "current_value_display",
+        "unrealized_gain_loss",
+        "unrealized_gain_loss_pct",
+    ]
+    st.dataframe(portfolio_df[table_cols], use_container_width=True)
+
+    total_original = portfolio_df["original_cost_display"].sum()
+    total_current = portfolio_df["current_value_display"].sum()
+    total_gain = total_current - total_original
+    total_gain_pct = (total_gain / total_original) if total_original else 0
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Original Invested Value", format_currency(total_original, display_currency))
+    k2.metric("Current Value", format_currency(total_current, display_currency))
+    k3.metric("Unrealized Gain/Loss", format_currency(total_gain, display_currency))
+    k4.metric("Unrealized Gain/Loss %", f"{total_gain_pct * 100:.2f}%")
 
     st.subheader("Allocation Chart")
-    alloc = portfolio_df.groupby("ticker", as_index=False)["position_value"].sum()
-    if alloc["position_value"].sum() > 0:
+    alloc = portfolio_df.groupby("ticker", as_index=False)["current_value_display"].sum()
+    if alloc["current_value_display"].sum() > 0:
         st.plotly_chart(
             {
                 "data": [
                     {
                         "labels": alloc["ticker"],
-                        "values": alloc["position_value"],
+                        "values": alloc["current_value_display"],
                         "type": "pie",
                     }
                 ],
