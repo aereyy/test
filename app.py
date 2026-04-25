@@ -76,6 +76,151 @@ def get_portfolio():
     return df
 
 
+def to_float(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    cleaned = (
+        text.replace(",", "")
+        .replace("£", "")
+        .replace("$", "")
+        .replace("€", "")
+        .replace("Kč", "")
+    )
+    try:
+        return float(cleaned)
+    except ValueError:
+        return 0.0
+
+
+def parse_trading212_transactions(csv_df):
+    normalized = {col.strip().lower(): col for col in csv_df.columns}
+
+    required_columns = [
+        "action",
+        "ticker",
+        "name",
+        "no. of shares",
+        "price / share",
+        "currency",
+        "total",
+        "withholding tax",
+        "currency conversion",
+    ]
+    for col in required_columns:
+        if col not in normalized:
+            csv_df[col] = None
+            normalized[col] = col
+
+    records = {}
+    summary = {
+        "realized_gains": 0.0,
+        "dividend_income": 0.0,
+        "lending_income": 0.0,
+        "interest_on_cash": 0.0,
+        "total_deposits": 0.0,
+        "withholding_tax": 0.0,
+    }
+
+    def amount_from_row(row):
+        converted = to_float(row[normalized["currency conversion"]])
+        if converted != 0:
+            return converted
+        return to_float(row[normalized["total"]])
+
+    for _, row in csv_df.iterrows():
+        action = str(row[normalized["action"]]).strip().lower()
+        ticker = str(row[normalized["ticker"]]).strip().upper()
+        name = str(row[normalized["name"]]).strip()
+        shares = to_float(row[normalized["no. of shares"]])
+        price = to_float(row[normalized["price / share"]])
+        currency = str(row[normalized["currency"]]).strip().upper() or "USD"
+        amount = amount_from_row(row)
+        withholding_tax = to_float(row[normalized["withholding tax"]])
+
+        if withholding_tax:
+            summary["withholding_tax"] += abs(withholding_tax)
+
+        if action == "market buy":
+            if not ticker or shares <= 0:
+                continue
+            if ticker not in records:
+                records[ticker] = {
+                    "ticker": ticker,
+                    "name": name,
+                    "shares": 0.0,
+                    "cost_basis": 0.0,
+                    "avg_cost": 0.0,
+                    "currency": currency,
+                    "realized_gains": 0.0,
+                }
+            buy_cost = abs(amount) if amount != 0 else shares * price
+            records[ticker]["cost_basis"] += buy_cost
+            records[ticker]["shares"] += shares
+            if records[ticker]["shares"] > 0:
+                records[ticker]["avg_cost"] = records[ticker]["cost_basis"] / records[ticker]["shares"]
+        elif action == "market sell":
+            if not ticker or shares <= 0:
+                continue
+            if ticker not in records:
+                records[ticker] = {
+                    "ticker": ticker,
+                    "name": name,
+                    "shares": 0.0,
+                    "cost_basis": 0.0,
+                    "avg_cost": 0.0,
+                    "currency": currency,
+                    "realized_gains": 0.0,
+                }
+            held_shares = records[ticker]["shares"]
+            sell_shares = min(shares, held_shares) if held_shares > 0 else shares
+            proceeds = abs(amount) if amount != 0 else sell_shares * price
+            avg_cost = records[ticker]["avg_cost"]
+            cost_of_sold = avg_cost * sell_shares
+            realized = proceeds - cost_of_sold
+            records[ticker]["realized_gains"] += realized
+            summary["realized_gains"] += realized
+            records[ticker]["shares"] = max(held_shares - sell_shares, 0.0)
+            records[ticker]["cost_basis"] = max(records[ticker]["cost_basis"] - cost_of_sold, 0.0)
+            if records[ticker]["shares"] > 0:
+                records[ticker]["avg_cost"] = records[ticker]["cost_basis"] / records[ticker]["shares"]
+            else:
+                records[ticker]["avg_cost"] = 0.0
+        elif action == "dividend":
+            summary["dividend_income"] += amount
+        elif action == "lending interest":
+            summary["lending_income"] += amount
+        elif action == "interest on cash":
+            summary["interest_on_cash"] += amount
+        elif action == "deposit":
+            summary["total_deposits"] += amount
+        else:
+            continue
+
+    holdings = []
+    for rec in records.values():
+        if rec["shares"] > 0:
+            holdings.append(
+                {
+                    "ticker": rec["ticker"],
+                    "name": rec["name"],
+                    "shares": rec["shares"],
+                    "purchase_price": rec["avg_cost"],
+                    "purchase_currency": rec["currency"] if rec["currency"] in CURRENCIES else "USD",
+                    "purchase_date": None,
+                    "purchase_fx_to_usd": 1.0,
+                    "cost_basis_local": rec["cost_basis"],
+                }
+            )
+
+    holdings_df = pd.DataFrame(holdings)
+    return holdings_df, summary
+
+
 def fetch_fx_rate(base_currency, quote_currency, at_date=None):
     if base_currency == quote_currency:
         return 1.0
@@ -201,6 +346,18 @@ def main():
 
     init_db()
 
+    st.subheader("Import Trading212 CSV")
+    uploaded_csv = st.file_uploader("Upload Trading212 transaction export", type=["csv"])
+    imported_holdings_df = None
+    imported_summary = None
+    if uploaded_csv is not None:
+        try:
+            csv_df = pd.read_csv(uploaded_csv)
+            imported_holdings_df, imported_summary = parse_trading212_transactions(csv_df)
+            st.success("Trading212 CSV parsed successfully. Portfolio rebuilt from transactions.")
+        except Exception as exc:
+            st.error(f"Failed to parse CSV: {exc}")
+
     st.sidebar.header("Add Portfolio Position")
     ticker_input = st.sidebar.text_input("Ticker", placeholder="AAPL")
     shares_input = st.sidebar.number_input("Shares", min_value=0.0, value=1.0, step=1.0)
@@ -229,7 +386,10 @@ def main():
         else:
             st.sidebar.error("Please enter a ticker")
 
-    portfolio_df = get_portfolio()
+    if imported_holdings_df is not None:
+        portfolio_df = imported_holdings_df.copy()
+    else:
+        portfolio_df = get_portfolio()
 
     if portfolio_df.empty:
         st.info("No positions yet. Add a stock from the sidebar.")
@@ -294,7 +454,10 @@ def main():
         "original_cost_display"
     ].replace(0, pd.NA)
 
-    st.subheader("Portfolio Table")
+    if imported_summary is not None:
+        st.subheader("Current Holdings")
+    else:
+        st.subheader("Portfolio Table")
     table_cols = [
         "ticker",
         "shares",
@@ -309,6 +472,25 @@ def main():
         "unrealized_gain_loss_pct",
     ]
     st.dataframe(portfolio_df[table_cols], use_container_width=True)
+
+    if imported_summary is not None:
+        st.subheader("Realized gains")
+        st.metric("Realized Gains", format_currency(imported_summary["realized_gains"], display_currency))
+
+        st.subheader("Dividend income")
+        st.metric("Dividend Income", format_currency(imported_summary["dividend_income"], display_currency))
+
+        st.subheader("Lending income")
+        st.metric("Lending Income", format_currency(imported_summary["lending_income"], display_currency))
+
+        st.subheader("Total deposits")
+        st.metric("Total Deposits", format_currency(imported_summary["total_deposits"], display_currency))
+
+        st.subheader("Tax summary")
+        st.metric("Tax Summary (Withholding)", format_currency(imported_summary["withholding_tax"], display_currency))
+
+        st.subheader("Additional cash interest")
+        st.metric("Interest on Cash", format_currency(imported_summary["interest_on_cash"], display_currency))
 
     total_original = portfolio_df["original_cost_display"].sum()
     total_current = portfolio_df["current_value_display"].sum()
