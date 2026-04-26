@@ -419,8 +419,8 @@ def main():
     init_db()
 
     st.subheader("Import Trading212 CSV")
-    uploaded_csv_files = st.file_uploader(
-        "Upload Trading212 transaction export",
+    uploaded_csv_files = st.sidebar.file_uploader(
+        "Import CSV",
         type=["csv"],
         accept_multiple_files=True,
     )
@@ -481,7 +481,14 @@ def main():
         except Exception as exc:
             st.error(f"Failed to parse CSV: {exc}")
 
-    st.sidebar.header("Controls")
+    st.sidebar.markdown("### Personal Stock\nPortfolio Analyzer")
+    selected_nav = st.sidebar.radio(
+        "Navigation",
+        ["Overview", "Holdings", "Transactions", "Income & Taxes", "Stock Research", "Settings"],
+        label_visibility="collapsed",
+    )
+    st.sidebar.divider()
+    st.sidebar.header("Portfolio Tools")
     with st.sidebar.expander("Add Portfolio Position", expanded=True):
         ticker_input = st.text_input("Ticker", placeholder="AAPL")
         shares_input = st.number_input("Shares", min_value=0.0, value=1.0, step=1.0)
@@ -554,7 +561,10 @@ def main():
     if missing_price_tickers:
         st.warning(f"Ticker mapping required: {', '.join(missing_price_tickers)}")
 
-    display_currency = st.selectbox("Display Currency", CURRENCIES, index=0)
+    ctrl_c1, ctrl_c2, ctrl_c3 = st.columns([1.2, 1.2, 1])
+    display_currency = ctrl_c1.selectbox("Display Currency", CURRENCIES, index=0)
+    ctrl_c2.date_input("As of", value=datetime.utcnow().date())
+    ctrl_c3.toggle("Dark Mode", value=True)
     usd_to_display = fetch_fx_rate("USD", display_currency)
     if usd_to_display is None:
         st.warning("Could not fetch current FX for display currency. Falling back to USD.")
@@ -620,10 +630,6 @@ def main():
     total_gain = total_current - total_original
     total_gain_pct = (total_gain / total_original) if total_original else 0
 
-    tab_portfolio, tab_transactions, tab_income, tab_research = st.tabs(
-        ["Portfolio", "Transactions", "Income & Taxes", "Stock Research"]
-    )
-
     table_cols = [
         "ticker",
         "market_ticker",
@@ -638,78 +644,136 @@ def main():
         "unrealized_gain_loss",
         "unrealized_gain_loss_pct",
     ]
-    with tab_portfolio:
-        st.subheader("Portfolio Dashboard")
+    if selected_nav == "Overview":
+        top_left, top_mid, top_right = st.columns([3, 2, 2])
+        with top_left:
+            st.markdown("## Portfolio Overview")
+            st.caption("All values displayed in selected currency")
+        with top_mid:
+            date_filter = st.date_input("Date filter", value=datetime.utcnow().date())
+        with top_right:
+            if st.button("Refresh Data", use_container_width=True):
+                st.cache_data.clear()
+
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Total Portfolio Value", format_currency(total_current, display_currency))
         k2.metric("Total Return", format_currency(total_gain, display_currency))
         k3.metric("Total Return %", f"{total_gain_pct * 100:.2f}%")
-        k4.metric("Dividend Income", format_currency(dividend_display, display_currency))
-
+        k4.metric("Total Deposits", format_currency(deposits_display, display_currency))
         k5, k6, k7, k8 = st.columns(4)
-        k5.metric("Realized Gains", format_currency(realized_display, display_currency))
-        k6.metric("Total Deposits", format_currency(deposits_display, display_currency))
+        k5.metric("Dividend Income", format_currency(dividend_display, display_currency))
+        k6.metric("Realized Gains", format_currency(realized_display, display_currency))
         k7.metric("Lending Income", format_currency(lending_display, display_currency))
-        k8.metric("Tax Summary", format_currency(tax_display, display_currency))
+        k8.metric("Tax Paid", format_currency(tax_display, display_currency))
 
-        st.markdown("#### Current Holdings")
+        center_col, right_col = st.columns([2.25, 1])
+        with center_col:
+            st.markdown("### Portfolio Value Over Time")
+            if transaction_history_df is not None and "_parsed_time" in transaction_history_df.columns:
+                perf_df = transaction_history_df.dropna(subset=["_parsed_time"]).copy()
+                normalized_cols = {col.strip().lower(): col for col in perf_df.columns}
+                action_col = normalized_cols.get("action")
+                total_col = normalized_cols.get("total")
+                if action_col and total_col and not perf_df.empty:
+                    perf_df["amount"] = perf_df[total_col].map(to_float)
+                    perf_df["action_l"] = perf_df[action_col].astype(str).str.lower()
+                    perf_df["cashflow"] = perf_df["amount"]
+                    perf_df.loc[perf_df["action_l"].str.contains("market buy", na=False), "cashflow"] *= -1
+                    perf_df = perf_df.sort_values("_parsed_time")
+                    perf_df["portfolio_flow"] = perf_df["cashflow"].cumsum()
+                    perf_df["deposits_line"] = perf_df["cashflow"].where(
+                        perf_df["action_l"].str.contains("deposit", na=False), 0
+                    ).cumsum()
+                    st.plotly_chart(
+                        {
+                            "data": [
+                                {
+                                    "x": perf_df["_parsed_time"],
+                                    "y": perf_df["portfolio_flow"],
+                                    "type": "scatter",
+                                    "mode": "lines",
+                                    "name": "Portfolio Value",
+                                    "line": {"shape": "spline", "width": 3, "color": "#8b5cf6"},
+                                },
+                                {
+                                    "x": perf_df["_parsed_time"],
+                                    "y": perf_df["deposits_line"],
+                                    "type": "scatter",
+                                    "mode": "lines",
+                                    "name": "Total Deposits",
+                                    "line": {"shape": "spline", "width": 2, "dash": "dot", "color": "#64748b"},
+                                },
+                            ],
+                            "layout": {
+                                "paper_bgcolor": "rgba(0,0,0,0)",
+                                "plot_bgcolor": "rgba(0,0,0,0)",
+                                "margin": {"l": 20, "r": 20, "t": 20, "b": 20},
+                                "xaxis": {"gridcolor": "rgba(255,255,255,0.06)"},
+                                "yaxis": {"gridcolor": "rgba(255,255,255,0.06)"},
+                            },
+                        },
+                        use_container_width=True,
+                    )
+            else:
+                st.info("Upload transaction history with dates to render performance chart.")
+
+        with right_col:
+            st.markdown("### Asset Allocation")
+            alloc = portfolio_df.groupby("ticker", as_index=False)["current_value_display"].sum()
+            if alloc["current_value_display"].sum() > 0:
+                st.plotly_chart(
+                    {
+                        "data": [
+                            {
+                                "labels": alloc["ticker"],
+                                "values": alloc["current_value_display"],
+                                "type": "pie",
+                                "hole": 0.62,
+                            }
+                        ],
+                        "layout": {
+                            "paper_bgcolor": "rgba(0,0,0,0)",
+                            "plot_bgcolor": "rgba(0,0,0,0)",
+                            "margin": {"l": 20, "r": 20, "t": 20, "b": 20},
+                        },
+                    },
+                    use_container_width=True,
+                )
+            st.markdown("### Income & Taxes Summary")
+            st.metric("Dividend Income", format_currency(dividend_display, display_currency))
+            st.metric("Lending Income", format_currency(lending_display, display_currency))
+            st.metric("Tax Paid", format_currency(tax_display, display_currency))
+
+        st.markdown("### Top Holdings")
         holdings_view = portfolio_df[table_cols].copy()
         holdings_view = holdings_view.sort_values(by="current_value_display", ascending=False)
+        holdings_view["allocation_pct"] = holdings_view["current_value_display"] / holdings_view["current_value_display"].sum()
         st.dataframe(
-            holdings_view.style.format(
-                {
-                    "original_cost_display": "{:,.2f}",
-                    "current_value_display": "{:,.2f}",
-                    "unrealized_gain_loss": "{:,.2f}",
-                    "unrealized_gain_loss_pct": "{:.2%}",
+            holdings_view.rename(
+                columns={
+                    "ticker": "Ticker",
+                    "shares": "Shares",
+                    "purchase_price": "Avg Price",
+                    "current_price": "Current Price",
+                    "current_value_display": "Market Value",
+                    "unrealized_gain_loss": "Gain/Loss",
+                    "unrealized_gain_loss_pct": "Return %",
+                    "allocation_pct": "Allocation %",
                 }
             ),
-            use_container_width=True,
             column_config={
-                "unrealized_gain_loss": st.column_config.NumberColumn("unrealized_gain_loss"),
-                "unrealized_gain_loss_pct": st.column_config.ProgressColumn(
-                    "unrealized_gain_loss_pct", min_value=-1.0, max_value=1.0
-                ),
+                "Allocation %": st.column_config.ProgressColumn("Allocation %", min_value=0, max_value=1),
+                "Return %": st.column_config.ProgressColumn("Return %", min_value=-1.0, max_value=1.0),
             },
+            use_container_width=True,
             hide_index=True,
         )
 
-        st.markdown("#### Allocation")
-        alloc = portfolio_df.groupby("ticker", as_index=False)["current_value_display"].sum()
-        if alloc["current_value_display"].sum() > 0:
-            st.plotly_chart(
-                {
-                    "data": [
-                        {
-                            "labels": alloc["ticker"],
-                            "values": alloc["current_value_display"],
-                            "type": "pie",
-                            "hole": 0.55,
-                        }
-                    ],
-                    "layout": {"margin": {"l": 20, "r": 20, "t": 20, "b": 20}},
-                },
-                use_container_width=True,
-            )
-        else:
-            st.write("Not enough live pricing data to build allocation chart yet.")
+    elif selected_nav == "Holdings":
+        st.subheader("Holdings")
+        st.dataframe(portfolio_df[table_cols], use_container_width=True, hide_index=True)
 
-        if transaction_history_df is not None and "_parsed_time" in transaction_history_df.columns:
-            perf_df = transaction_history_df.dropna(subset=["_parsed_time"]).copy()
-            normalized_cols = {col.strip().lower(): col for col in perf_df.columns}
-            action_col = normalized_cols.get("action")
-            total_col = normalized_cols.get("total")
-            if action_col and total_col and not perf_df.empty:
-                perf_df["amount"] = perf_df[total_col].map(to_float)
-                perf_df["action_l"] = perf_df[action_col].astype(str).str.lower()
-                perf_df["cashflow"] = perf_df["amount"]
-                perf_df.loc[perf_df["action_l"].str.contains("market buy", na=False), "cashflow"] *= -1
-                perf_df = perf_df.sort_values("_parsed_time")
-                perf_df["portfolio_flow"] = perf_df["cashflow"].cumsum()
-                st.markdown("#### Portfolio Performance (Transactions Over Time)")
-                st.line_chart(perf_df.set_index("_parsed_time")["portfolio_flow"])
-
-    with tab_transactions:
+    elif selected_nav == "Transactions":
         st.subheader("Transactions")
         debug_cols = [
             "ticker",
@@ -730,8 +794,7 @@ def main():
         )
         with st.expander("Debug transaction table", expanded=False):
             st.dataframe(debug_df, use_container_width=True, hide_index=True)
-
-    with tab_income:
+    elif selected_nav == "Income & Taxes":
         st.subheader("Income & Taxes")
         i1, i2, i3 = st.columns(3)
         i1.metric("Dividend Income", format_currency(dividend_display, display_currency))
@@ -740,8 +803,7 @@ def main():
         i4, i5 = st.columns(2)
         i4.metric("Total Deposits", format_currency(deposits_display, display_currency))
         i5.metric("Withholding Tax", format_currency(tax_display, display_currency))
-
-    with tab_research:
+    elif selected_nav == "Stock Research":
         st.subheader("Stock Research")
         selected = st.selectbox("Pick a stock", tickers)
         s = snapshots[selected]
@@ -775,6 +837,9 @@ def main():
             with st.spinner("Calling OpenAI..."):
                 ai_text = summarize_with_openai(s)
             st.markdown(ai_text)
+    else:
+        st.subheader("Settings")
+        st.write("Theme and dashboard preferences will appear here.")
 
 
 if __name__ == "__main__":
