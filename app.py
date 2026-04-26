@@ -121,13 +121,18 @@ def parse_trading212_transactions(csv_df):
 
     records = {}
     summary = {
-        "realized_gains": 0.0,
-        "dividend_income": 0.0,
-        "lending_income": 0.0,
-        "interest_on_cash": 0.0,
-        "total_deposits": 0.0,
-        "withholding_tax": 0.0,
+        "realized_gains": {},
+        "dividend_income": {},
+        "lending_income": {},
+        "interest_on_cash": {},
+        "total_deposits": {},
+        "withholding_tax": {},
     }
+
+    def add_summary_amount(key, currency, amount):
+        if not currency:
+            currency = "USD"
+        summary[key][currency] = summary[key].get(currency, 0.0) + amount
 
     def amount_from_row(row):
         return to_float(row[normalized["total"]])
@@ -144,7 +149,7 @@ def parse_trading212_transactions(csv_df):
         withholding_tax = to_float(row[normalized["withholding tax"]])
 
         if withholding_tax:
-            summary["withholding_tax"] += abs(withholding_tax)
+            add_summary_amount("withholding_tax", currency, abs(withholding_tax))
 
         if action == "market buy":
             if not ticker or shares <= 0:
@@ -184,7 +189,7 @@ def parse_trading212_transactions(csv_df):
             cost_of_sold = avg_cost * sell_shares
             realized = proceeds - cost_of_sold
             records[ticker]["realized_gains"] += realized
-            summary["realized_gains"] += realized
+            add_summary_amount("realized_gains", currency, realized)
             records[ticker]["shares"] = max(held_shares - sell_shares, 0.0)
             records[ticker]["cost_basis"] = max(records[ticker]["cost_basis"] - cost_of_sold, 0.0)
             if records[ticker]["shares"] > 0:
@@ -192,13 +197,13 @@ def parse_trading212_transactions(csv_df):
             else:
                 records[ticker]["avg_cost"] = 0.0
         elif "dividend" in action:
-            summary["dividend_income"] += amount
+            add_summary_amount("dividend_income", currency, amount)
         elif action == "lending interest":
-            summary["lending_income"] += amount
+            add_summary_amount("lending_income", currency, amount)
         elif action == "interest on cash":
-            summary["interest_on_cash"] += amount
+            add_summary_amount("interest_on_cash", currency, amount)
         elif action == "deposit":
-            summary["total_deposits"] += amount
+            add_summary_amount("total_deposits", currency, amount)
         else:
             continue
 
@@ -224,6 +229,7 @@ def parse_trading212_transactions(csv_df):
     return holdings_df, summary
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_fx_rate(base_currency, quote_currency, at_date=None):
     if base_currency == quote_currency:
         return 1.0
@@ -292,6 +298,7 @@ def resolve_market_ticker(ticker, manual_map):
     return DEFAULT_TICKER_MAP.get(t, t)
 
 
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_stock_snapshot(ticker):
     stock = yf.Ticker(ticker)
     info = stock.info or {}
@@ -313,11 +320,15 @@ def fetch_stock_snapshot(ticker):
     }
 
     news_items = []
-    for item in stock.news[:5]:
-        title = item.get("title")
-        link = item.get("link")
-        if title and link:
-            news_items.append({"title": title, "link": link})
+    raw_news = stock.news or []
+    if isinstance(raw_news, list):
+        for item in raw_news[:5]:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title")
+            link = item.get("link")
+            if title and link:
+                news_items.append({"title": title, "link": link})
 
     return snapshot, news_items
 
@@ -373,6 +384,14 @@ def format_currency(value, currency):
     if value is None:
         return "N/A"
     return f"{symbols.get(currency, '')}{value:,.2f} {currency}"
+
+
+def convert_currency_dict_to_display(amount_by_currency, display_currency):
+    total = 0.0
+    for currency, amount in amount_by_currency.items():
+        fx = fetch_fx_rate(currency, display_currency) or 1.0
+        total += amount * fx
+    return total
 
 
 def main():
@@ -552,23 +571,30 @@ def main():
     st.dataframe(debug_df, use_container_width=True)
 
     if imported_summary is not None:
+        realized_display = convert_currency_dict_to_display(imported_summary["realized_gains"], display_currency)
+        dividend_display = convert_currency_dict_to_display(imported_summary["dividend_income"], display_currency)
+        lending_display = convert_currency_dict_to_display(imported_summary["lending_income"], display_currency)
+        deposits_display = convert_currency_dict_to_display(imported_summary["total_deposits"], display_currency)
+        tax_display = convert_currency_dict_to_display(imported_summary["withholding_tax"], display_currency)
+        cash_interest_display = convert_currency_dict_to_display(imported_summary["interest_on_cash"], display_currency)
+
         st.subheader("Realized gains")
-        st.metric("Realized Gains", format_currency(imported_summary["realized_gains"], display_currency))
+        st.metric("Realized Gains", format_currency(realized_display, display_currency))
 
         st.subheader("Dividend income")
-        st.metric("Dividend Income", format_currency(imported_summary["dividend_income"], display_currency))
+        st.metric("Dividend Income", format_currency(dividend_display, display_currency))
 
         st.subheader("Lending income")
-        st.metric("Lending Income", format_currency(imported_summary["lending_income"], display_currency))
+        st.metric("Lending Income", format_currency(lending_display, display_currency))
 
         st.subheader("Total deposits")
-        st.metric("Total Deposits", format_currency(imported_summary["total_deposits"], display_currency))
+        st.metric("Total Deposits", format_currency(deposits_display, display_currency))
 
         st.subheader("Tax summary")
-        st.metric("Tax Summary (Withholding)", format_currency(imported_summary["withholding_tax"], display_currency))
+        st.metric("Tax Summary (Withholding)", format_currency(tax_display, display_currency))
 
         st.subheader("Additional cash interest")
-        st.metric("Interest on Cash", format_currency(imported_summary["interest_on_cash"], display_currency))
+        st.metric("Interest on Cash", format_currency(cash_interest_display, display_currency))
 
     total_original = portfolio_df["original_cost_display"].sum()
     total_current = portfolio_df["current_value_display"].sum()
