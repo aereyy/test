@@ -396,7 +396,25 @@ def convert_currency_dict_to_display(amount_by_currency, display_currency):
 
 def main():
     st.set_page_config(page_title="Portfolio Analyzer", layout="wide")
-    st.title("📊 Personal Stock Portfolio Analyzer")
+    st.markdown(
+        """
+        <style>
+        .stApp {background: linear-gradient(180deg, #0b1020 0%, #090d18 100%);}
+        .block-container {padding-top: 1.2rem;}
+        .hero-title {font-size: 2.1rem; font-weight: 700; margin-bottom: 0.1rem;}
+        .hero-sub {color: #9aa4b2; margin-bottom: 1rem;}
+        div[data-testid="stMetric"] {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 14px;
+            padding: 12px 14px;
+        }
+        </style>
+        <div class="hero-title">💹 Portfolio Intelligence Dashboard</div>
+        <div class="hero-sub">Track holdings, income, taxes, and research in one premium view.</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     init_db()
 
@@ -413,16 +431,29 @@ def main():
         try:
             csv_frames = [pd.read_csv(file) for file in uploaded_csv_files]
             csv_df = pd.concat(csv_frames, ignore_index=True) if csv_frames else pd.DataFrame()
+            raw_rows = len(csv_df)
 
             normalized = {col.strip().lower(): col for col in csv_df.columns}
+            id_col = normalized.get("id")
             time_col = normalized.get("time")
             action_col = normalized.get("action")
             ticker_col = normalized.get("ticker")
             total_col = normalized.get("total")
+            shares_col = normalized.get("no. of shares")
 
-            dedupe_cols = [c for c in [time_col, action_col, ticker_col, total_col] if c]
-            if dedupe_cols:
-                csv_df = csv_df.drop_duplicates(subset=dedupe_cols)
+            if id_col:
+                with_id = csv_df[csv_df[id_col].notna() & (csv_df[id_col].astype(str).str.strip() != "")]
+                without_id = csv_df[~(csv_df[id_col].notna() & (csv_df[id_col].astype(str).str.strip() != ""))]
+                with_id = with_id.drop_duplicates(subset=[id_col], keep="first")
+
+                fallback_cols = [c for c in [action_col, time_col, ticker_col, total_col, shares_col] if c]
+                if fallback_cols:
+                    without_id = without_id.drop_duplicates(subset=fallback_cols, keep="first")
+                csv_df = pd.concat([with_id, without_id], ignore_index=True)
+            else:
+                fallback_cols = [c for c in [action_col, time_col, ticker_col, total_col, shares_col] if c]
+                if fallback_cols:
+                    csv_df = csv_df.drop_duplicates(subset=fallback_cols, keep="first")
 
             if time_col:
                 csv_df["_parsed_time"] = pd.to_datetime(csv_df[time_col], errors="coerce")
@@ -432,6 +463,7 @@ def main():
             imported_holdings_df, imported_summary = parse_trading212_transactions(csv_df)
 
             total_transactions = len(csv_df)
+            duplicates_removed = raw_rows - total_transactions
             date_range = "N/A"
             if "_parsed_time" in csv_df.columns and csv_df["_parsed_time"].notna().any():
                 min_date = csv_df["_parsed_time"].min().date().isoformat()
@@ -441,22 +473,26 @@ def main():
             st.success("Trading212 CSV files parsed successfully. Portfolio rebuilt from merged transactions.")
             st.caption(
                 f"Uploaded files: {len(uploaded_csv_files)} | "
-                f"Transactions imported: {total_transactions} | "
+                f"Raw rows: {raw_rows} | "
+                f"Duplicates removed: {duplicates_removed} | "
+                f"Final rows used: {total_transactions} | "
                 f"Date range: {date_range}"
             )
         except Exception as exc:
             st.error(f"Failed to parse CSV: {exc}")
 
-    st.sidebar.header("Add Portfolio Position")
-    ticker_input = st.sidebar.text_input("Ticker", placeholder="AAPL")
-    shares_input = st.sidebar.number_input("Shares", min_value=0.0, value=1.0, step=1.0)
-    purchase_price_input = st.sidebar.number_input("Purchase Price", min_value=0.0, value=0.0, step=1.0)
-    purchase_currency_input = st.sidebar.selectbox("Purchase Currency", CURRENCIES, index=0)
-    purchase_date_input = st.sidebar.date_input("Purchase Date")
-    manual_map_text = st.sidebar.text_input("Manual ticker map (e.g. HBH=HBH.PR)", value="")
+    st.sidebar.header("Controls")
+    with st.sidebar.expander("Add Portfolio Position", expanded=True):
+        ticker_input = st.text_input("Ticker", placeholder="AAPL")
+        shares_input = st.number_input("Shares", min_value=0.0, value=1.0, step=1.0)
+        purchase_price_input = st.number_input("Purchase Price", min_value=0.0, value=0.0, step=1.0)
+        purchase_currency_input = st.selectbox("Purchase Currency", CURRENCIES, index=0)
+        purchase_date_input = st.date_input("Purchase Date")
+    with st.sidebar.expander("Ticker Mapping", expanded=False):
+        manual_map_text = st.text_input("Manual ticker map (e.g. HBH=HBH.PR)", value="")
     manual_ticker_map = parse_manual_ticker_mapping(manual_map_text)
 
-    if st.sidebar.button("Add Position"):
+    if st.sidebar.button("Add Position", use_container_width=True):
         if ticker_input.strip():
             purchase_date_str = purchase_date_input.strftime("%Y-%m-%d")
             hist_fx = fetch_fx_rate(purchase_currency_input, "USD", at_date=purchase_date_str)
@@ -604,18 +640,39 @@ def main():
     ]
     with tab_portfolio:
         st.subheader("Portfolio Dashboard")
-        k1, k2, k3 = st.columns(3)
+        k1, k2, k3, k4 = st.columns(4)
         k1.metric("Total Portfolio Value", format_currency(total_current, display_currency))
         k2.metric("Total Return", format_currency(total_gain, display_currency))
         k3.metric("Total Return %", f"{total_gain_pct * 100:.2f}%")
+        k4.metric("Dividend Income", format_currency(dividend_display, display_currency))
 
-        k4, k5, k6 = st.columns(3)
-        k4.metric("Total Deposits", format_currency(deposits_display, display_currency))
-        k5.metric("Dividend Income", format_currency(dividend_display, display_currency))
-        k6.metric("Realized Gains", format_currency(realized_display, display_currency))
+        k5, k6, k7, k8 = st.columns(4)
+        k5.metric("Realized Gains", format_currency(realized_display, display_currency))
+        k6.metric("Total Deposits", format_currency(deposits_display, display_currency))
+        k7.metric("Lending Income", format_currency(lending_display, display_currency))
+        k8.metric("Tax Summary", format_currency(tax_display, display_currency))
 
         st.markdown("#### Current Holdings")
-        st.dataframe(portfolio_df[table_cols], use_container_width=True)
+        holdings_view = portfolio_df[table_cols].copy()
+        holdings_view = holdings_view.sort_values(by="current_value_display", ascending=False)
+        st.dataframe(
+            holdings_view.style.format(
+                {
+                    "original_cost_display": "{:,.2f}",
+                    "current_value_display": "{:,.2f}",
+                    "unrealized_gain_loss": "{:,.2f}",
+                    "unrealized_gain_loss_pct": "{:.2%}",
+                }
+            ),
+            use_container_width=True,
+            column_config={
+                "unrealized_gain_loss": st.column_config.NumberColumn("unrealized_gain_loss"),
+                "unrealized_gain_loss_pct": st.column_config.ProgressColumn(
+                    "unrealized_gain_loss_pct", min_value=-1.0, max_value=1.0
+                ),
+            },
+            hide_index=True,
+        )
 
         st.markdown("#### Allocation")
         alloc = portfolio_df.groupby("ticker", as_index=False)["current_value_display"].sum()
@@ -671,7 +728,8 @@ def main():
                 "current_value_display": f"current value ({display_currency})",
             }
         )
-        st.dataframe(debug_df, use_container_width=True)
+        with st.expander("Debug transaction table", expanded=False):
+            st.dataframe(debug_df, use_container_width=True, hide_index=True)
 
     with tab_income:
         st.subheader("Income & Taxes")
@@ -687,6 +745,13 @@ def main():
         st.subheader("Stock Research")
         selected = st.selectbox("Pick a stock", tickers)
         s = snapshots[selected]
+        logo_url = None
+        try:
+            logo_url = yf.Ticker(selected).info.get("logo_url")
+        except Exception:
+            logo_url = None
+        if logo_url:
+            st.image(logo_url, width=48)
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Market Cap", format_number(s["market_cap"]))
