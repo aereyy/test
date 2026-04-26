@@ -401,14 +401,47 @@ def main():
     init_db()
 
     st.subheader("Import Trading212 CSV")
-    uploaded_csv = st.file_uploader("Upload Trading212 transaction export", type=["csv"])
+    uploaded_csv_files = st.file_uploader(
+        "Upload Trading212 transaction export",
+        type=["csv"],
+        accept_multiple_files=True,
+    )
     imported_holdings_df = None
     imported_summary = None
-    if uploaded_csv is not None:
+    if uploaded_csv_files:
         try:
-            csv_df = pd.read_csv(uploaded_csv)
+            csv_frames = [pd.read_csv(file) for file in uploaded_csv_files]
+            csv_df = pd.concat(csv_frames, ignore_index=True) if csv_frames else pd.DataFrame()
+
+            normalized = {col.strip().lower(): col for col in csv_df.columns}
+            time_col = normalized.get("time")
+            action_col = normalized.get("action")
+            ticker_col = normalized.get("ticker")
+            total_col = normalized.get("total")
+
+            dedupe_cols = [c for c in [time_col, action_col, ticker_col, total_col] if c]
+            if dedupe_cols:
+                csv_df = csv_df.drop_duplicates(subset=dedupe_cols)
+
+            if time_col:
+                csv_df["_parsed_time"] = pd.to_datetime(csv_df[time_col], errors="coerce")
+                csv_df = csv_df.sort_values(by="_parsed_time", na_position="last")
+
             imported_holdings_df, imported_summary = parse_trading212_transactions(csv_df)
-            st.success("Trading212 CSV parsed successfully. Portfolio rebuilt from transactions.")
+
+            total_transactions = len(csv_df)
+            date_range = "N/A"
+            if "_parsed_time" in csv_df.columns and csv_df["_parsed_time"].notna().any():
+                min_date = csv_df["_parsed_time"].min().date().isoformat()
+                max_date = csv_df["_parsed_time"].max().date().isoformat()
+                date_range = f"{min_date} to {max_date}"
+
+            st.success("Trading212 CSV files parsed successfully. Portfolio rebuilt from merged transactions.")
+            st.caption(
+                f"Uploaded files: {len(uploaded_csv_files)} | "
+                f"Transactions imported: {total_transactions} | "
+                f"Date range: {date_range}"
+            )
         except Exception as exc:
             st.error(f"Failed to parse CSV: {exc}")
 
