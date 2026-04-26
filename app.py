@@ -408,6 +408,7 @@ def main():
     )
     imported_holdings_df = None
     imported_summary = None
+    transaction_history_df = None
     if uploaded_csv_files:
         try:
             csv_frames = [pd.read_csv(file) for file in uploaded_csv_files]
@@ -426,6 +427,7 @@ def main():
             if time_col:
                 csv_df["_parsed_time"] = pd.to_datetime(csv_df[time_col], errors="coerce")
                 csv_df = csv_df.sort_values(by="_parsed_time", na_position="last")
+            transaction_history_df = csv_df.copy()
 
             imported_holdings_df, imported_summary = parse_trading212_transactions(csv_df)
 
@@ -563,10 +565,29 @@ def main():
         "original_cost_display"
     ].replace(0, pd.NA)
 
+    realized_display = 0.0
+    dividend_display = 0.0
+    lending_display = 0.0
+    deposits_display = 0.0
+    tax_display = 0.0
+    cash_interest_display = 0.0
     if imported_summary is not None:
-        st.subheader("Current Holdings")
-    else:
-        st.subheader("Portfolio Table")
+        realized_display = convert_currency_dict_to_display(imported_summary["realized_gains"], display_currency)
+        dividend_display = convert_currency_dict_to_display(imported_summary["dividend_income"], display_currency)
+        lending_display = convert_currency_dict_to_display(imported_summary["lending_income"], display_currency)
+        deposits_display = convert_currency_dict_to_display(imported_summary["total_deposits"], display_currency)
+        tax_display = convert_currency_dict_to_display(imported_summary["withholding_tax"], display_currency)
+        cash_interest_display = convert_currency_dict_to_display(imported_summary["interest_on_cash"], display_currency)
+
+    total_original = portfolio_df["original_cost_display"].sum()
+    total_current = portfolio_df["current_value_display"].sum()
+    total_gain = total_current - total_original
+    total_gain_pct = (total_gain / total_original) if total_original else 0
+
+    tab_portfolio, tab_transactions, tab_income, tab_research = st.tabs(
+        ["Portfolio", "Transactions", "Income & Taxes", "Stock Research"]
+    )
+
     table_cols = [
         "ticker",
         "market_ticker",
@@ -581,110 +602,114 @@ def main():
         "unrealized_gain_loss",
         "unrealized_gain_loss_pct",
     ]
-    st.dataframe(portfolio_df[table_cols], use_container_width=True)
+    with tab_portfolio:
+        st.subheader("Portfolio Dashboard")
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Total Portfolio Value", format_currency(total_current, display_currency))
+        k2.metric("Total Return", format_currency(total_gain, display_currency))
+        k3.metric("Total Return %", f"{total_gain_pct * 100:.2f}%")
 
-    debug_cols = [
-        "ticker",
-        "market_ticker",
-        "shares",
-        "original_cost_local",
-        "original_currency",
-        "current_price",
-        "current_value_display",
-    ]
-    st.subheader("Debug Transaction Table")
-    debug_df = portfolio_df[debug_cols].rename(
-        columns={
-            "market_ticker": "mapped ticker",
-            "original_cost_local": "original total",
-            "original_currency": "original currency",
-            "current_value_display": f"current value ({display_currency})",
-        }
-    )
-    st.dataframe(debug_df, use_container_width=True)
+        k4, k5, k6 = st.columns(3)
+        k4.metric("Total Deposits", format_currency(deposits_display, display_currency))
+        k5.metric("Dividend Income", format_currency(dividend_display, display_currency))
+        k6.metric("Realized Gains", format_currency(realized_display, display_currency))
 
-    if imported_summary is not None:
-        realized_display = convert_currency_dict_to_display(imported_summary["realized_gains"], display_currency)
-        dividend_display = convert_currency_dict_to_display(imported_summary["dividend_income"], display_currency)
-        lending_display = convert_currency_dict_to_display(imported_summary["lending_income"], display_currency)
-        deposits_display = convert_currency_dict_to_display(imported_summary["total_deposits"], display_currency)
-        tax_display = convert_currency_dict_to_display(imported_summary["withholding_tax"], display_currency)
-        cash_interest_display = convert_currency_dict_to_display(imported_summary["interest_on_cash"], display_currency)
+        st.markdown("#### Current Holdings")
+        st.dataframe(portfolio_df[table_cols], use_container_width=True)
 
-        st.subheader("Realized gains")
-        st.metric("Realized Gains", format_currency(realized_display, display_currency))
+        st.markdown("#### Allocation")
+        alloc = portfolio_df.groupby("ticker", as_index=False)["current_value_display"].sum()
+        if alloc["current_value_display"].sum() > 0:
+            st.plotly_chart(
+                {
+                    "data": [
+                        {
+                            "labels": alloc["ticker"],
+                            "values": alloc["current_value_display"],
+                            "type": "pie",
+                            "hole": 0.55,
+                        }
+                    ],
+                    "layout": {"margin": {"l": 20, "r": 20, "t": 20, "b": 20}},
+                },
+                use_container_width=True,
+            )
+        else:
+            st.write("Not enough live pricing data to build allocation chart yet.")
 
-        st.subheader("Dividend income")
-        st.metric("Dividend Income", format_currency(dividend_display, display_currency))
+        if transaction_history_df is not None and "_parsed_time" in transaction_history_df.columns:
+            perf_df = transaction_history_df.dropna(subset=["_parsed_time"]).copy()
+            normalized_cols = {col.strip().lower(): col for col in perf_df.columns}
+            action_col = normalized_cols.get("action")
+            total_col = normalized_cols.get("total")
+            if action_col and total_col and not perf_df.empty:
+                perf_df["amount"] = perf_df[total_col].map(to_float)
+                perf_df["action_l"] = perf_df[action_col].astype(str).str.lower()
+                perf_df["cashflow"] = perf_df["amount"]
+                perf_df.loc[perf_df["action_l"].str.contains("market buy", na=False), "cashflow"] *= -1
+                perf_df = perf_df.sort_values("_parsed_time")
+                perf_df["portfolio_flow"] = perf_df["cashflow"].cumsum()
+                st.markdown("#### Portfolio Performance (Transactions Over Time)")
+                st.line_chart(perf_df.set_index("_parsed_time")["portfolio_flow"])
 
-        st.subheader("Lending income")
-        st.metric("Lending Income", format_currency(lending_display, display_currency))
-
-        st.subheader("Total deposits")
-        st.metric("Total Deposits", format_currency(deposits_display, display_currency))
-
-        st.subheader("Tax summary")
-        st.metric("Tax Summary (Withholding)", format_currency(tax_display, display_currency))
-
-        st.subheader("Additional cash interest")
-        st.metric("Interest on Cash", format_currency(cash_interest_display, display_currency))
-
-    total_original = portfolio_df["original_cost_display"].sum()
-    total_current = portfolio_df["current_value_display"].sum()
-    total_gain = total_current - total_original
-    total_gain_pct = (total_gain / total_original) if total_original else 0
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Original Invested Value", format_currency(total_original, display_currency))
-    k2.metric("Current Value", format_currency(total_current, display_currency))
-    k3.metric("Unrealized Gain/Loss", format_currency(total_gain, display_currency))
-    k4.metric("Unrealized Gain/Loss %", f"{total_gain_pct * 100:.2f}%")
-
-    st.subheader("Allocation Chart")
-    alloc = portfolio_df.groupby("ticker", as_index=False)["current_value_display"].sum()
-    if alloc["current_value_display"].sum() > 0:
-        st.plotly_chart(
-            {
-                "data": [
-                    {
-                        "labels": alloc["ticker"],
-                        "values": alloc["current_value_display"],
-                        "type": "pie",
-                    }
-                ],
-                "layout": {"margin": {"l": 20, "r": 20, "t": 20, "b": 20}},
-            },
-            use_container_width=True,
+    with tab_transactions:
+        st.subheader("Transactions")
+        debug_cols = [
+            "ticker",
+            "market_ticker",
+            "shares",
+            "original_cost_local",
+            "original_currency",
+            "current_price",
+            "current_value_display",
+        ]
+        debug_df = portfolio_df[debug_cols].rename(
+            columns={
+                "market_ticker": "mapped ticker",
+                "original_cost_local": "original total",
+                "original_currency": "original currency",
+                "current_value_display": f"current value ({display_currency})",
+            }
         )
-    else:
-        st.write("Not enough live pricing data to build allocation chart yet.")
+        st.dataframe(debug_df, use_container_width=True)
 
-    st.subheader("Stock Detail Cards")
-    selected = st.selectbox("Pick a stock", tickers)
-    s = snapshots[selected]
+    with tab_income:
+        st.subheader("Income & Taxes")
+        i1, i2, i3 = st.columns(3)
+        i1.metric("Dividend Income", format_currency(dividend_display, display_currency))
+        i2.metric("Lending Income", format_currency(lending_display, display_currency))
+        i3.metric("Interest on Cash", format_currency(cash_interest_display, display_currency))
+        i4, i5 = st.columns(2)
+        i4.metric("Total Deposits", format_currency(deposits_display, display_currency))
+        i5.metric("Withholding Tax", format_currency(tax_display, display_currency))
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Market Cap", format_number(s["market_cap"]))
-    c2.metric("P/E Ratio", format_number(s["pe_ratio"]))
-    c3.metric("Debt to Equity", format_number(s["debt_to_equity"]))
+    with tab_research:
+        st.subheader("Stock Research")
+        selected = st.selectbox("Pick a stock", tickers)
+        s = snapshots[selected]
 
-    c4, c5, c6 = st.columns(3)
-    c4.metric("Revenue Growth", format_number(s["revenue_growth"], pct=True))
-    c5.metric("Profit Margins", format_number(s["profit_margins"], pct=True))
-    c6.metric("Analyst Recommendation", str(s["analyst_recommendation"]).upper())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Market Cap", format_number(s["market_cap"]))
+        c2.metric("P/E Ratio", format_number(s["pe_ratio"]))
+        c3.metric("Debt to Equity", format_number(s["debt_to_equity"]))
 
-    st.subheader(f"Recent News: {selected}")
-    if news_by_ticker[selected]:
-        for item in news_by_ticker[selected]:
-            st.markdown(f"- [{item['title']}]({item['link']})")
-    else:
-        st.write("No recent headlines found.")
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Revenue Growth", format_number(s["revenue_growth"], pct=True))
+        c5.metric("Profit Margins", format_number(s["profit_margins"], pct=True))
+        c6.metric("Analyst Recommendation", str(s["analyst_recommendation"]).upper())
 
-    st.subheader("AI Investment Analysis")
-    if st.button(f"Generate analysis for {selected}"):
-        with st.spinner("Calling OpenAI..."):
-            ai_text = summarize_with_openai(s)
-        st.markdown(ai_text)
+        st.markdown(f"#### Recent News: {selected}")
+        if news_by_ticker[selected]:
+            for item in news_by_ticker[selected]:
+                st.markdown(f"- [{item['title']}]({item['link']})")
+        else:
+            st.write("No recent headlines found.")
+
+        st.markdown("#### AI Investment Analysis")
+        if st.button(f"Generate analysis for {selected}"):
+            with st.spinner("Calling OpenAI..."):
+                ai_text = summarize_with_openai(s)
+            st.markdown(ai_text)
 
 
 if __name__ == "__main__":
