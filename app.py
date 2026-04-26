@@ -9,7 +9,7 @@ from openai import OpenAI
 
 DB_PATH = "portfolio.db"
 CURRENCIES = ["USD", "EUR", "CZK", "GBP"]
-DEFAULT_TICKER_MAP = {"VUSA": "VUSA.L", "VUAG": "VUAG.L"}
+DEFAULT_TICKER_MAP = {"VUSA": "VUSA.L", "VUAG": "VUAG.L", "HBH": "HBH.DE"}
 
 
 def init_db():
@@ -191,7 +191,7 @@ def parse_trading212_transactions(csv_df):
                 records[ticker]["avg_cost"] = records[ticker]["cost_basis"] / records[ticker]["shares"]
             else:
                 records[ticker]["avg_cost"] = 0.0
-        elif action == "dividend":
+        elif "dividend" in action:
             summary["dividend_income"] += amount
         elif action == "lending interest":
             summary["lending_income"] += amount
@@ -251,11 +251,20 @@ def fetch_fx_rate(base_currency, quote_currency, at_date=None):
     if direct is not None:
         return direct
 
+    inverse = _direct_rate(quote_currency, base_currency)
+    if inverse not in (None, 0):
+        return 1 / inverse
+
     # Fallback bridge through USD for pairs that may not exist directly.
     to_usd = _direct_rate(base_currency, "USD")
     usd_to_target = _direct_rate("USD", quote_currency)
     if to_usd is not None and usd_to_target is not None:
         return to_usd * usd_to_target
+
+    usd_to_base = _direct_rate("USD", base_currency)
+    target_to_usd = _direct_rate(quote_currency, "USD")
+    if usd_to_base not in (None, 0) and target_to_usd not in (None, 0):
+        return (1 / usd_to_base) * (1 / target_to_usd)
 
     return None
 
@@ -449,6 +458,12 @@ def main():
                 }
                 news_by_ticker[ticker] = []
 
+    missing_price_tickers = [
+        t for t in tickers if snapshots.get(t, {}).get("current_price") in (None, 0)
+    ]
+    if missing_price_tickers:
+        st.warning(f"Ticker mapping required: {', '.join(missing_price_tickers)}")
+
     display_currency = st.selectbox("Display Currency", CURRENCIES, index=0)
     usd_to_display = fetch_fx_rate("USD", display_currency)
     if usd_to_display is None:
@@ -525,7 +540,7 @@ def main():
         "current_price",
         "current_value_display",
     ]
-    st.subheader("Debug Table")
+    st.subheader("Debug Transaction Table")
     debug_df = portfolio_df[debug_cols].rename(
         columns={
             "market_ticker": "mapped ticker",
