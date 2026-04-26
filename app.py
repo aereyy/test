@@ -502,11 +502,11 @@ def main():
         portfolio_df["original_currency"] = portfolio_df["original_currency"].fillna(
             portfolio_df["purchase_currency"]
         )
-        portfolio_df["purchase_to_usd_now"] = portfolio_df["original_currency"].map(
-            lambda c: fetch_fx_rate(c, "USD") or 1.0
+        portfolio_df["original_to_display"] = portfolio_df["original_currency"].map(
+            lambda c: fetch_fx_rate(c, display_currency) or 1.0
         )
-        portfolio_df["original_cost_usd"] = (
-            portfolio_df["original_cost_local"] * portfolio_df["purchase_to_usd_now"]
+        portfolio_df["original_cost_display"] = (
+            portfolio_df["original_cost_local"] * portfolio_df["original_to_display"]
         )
     else:
         portfolio_df["original_cost_local"] = portfolio_df["shares"] * portfolio_df["purchase_price"].fillna(0)
@@ -514,7 +514,7 @@ def main():
         portfolio_df["original_cost_usd"] = (
             portfolio_df["original_cost_local"] * portfolio_df["purchase_fx_to_usd"].fillna(1.0)
         )
-    portfolio_df["original_cost_display"] = portfolio_df["original_cost_usd"] * usd_to_display
+        portfolio_df["original_cost_display"] = portfolio_df["original_cost_usd"] * usd_to_display
 
     portfolio_df["stock_to_usd_now"] = portfolio_df["stock_currency"].map(
         lambda c: fetch_fx_rate(c, "USD") or 1.0
