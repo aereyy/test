@@ -9,6 +9,7 @@ from openai import OpenAI
 
 DB_PATH = "portfolio.db"
 CURRENCIES = ["USD", "EUR", "CZK", "GBP"]
+DEFAULT_TICKER_MAP = {"VUSA": "VUSA.L", "VUAG": "VUAG.L"}
 
 
 def init_db():
@@ -107,6 +108,8 @@ def parse_trading212_transactions(csv_df):
         "no. of shares",
         "price / share",
         "currency",
+        "currency (total)",
+        "exchange rate",
         "total",
         "withholding tax",
         "currency conversion",
@@ -127,9 +130,6 @@ def parse_trading212_transactions(csv_df):
     }
 
     def amount_from_row(row):
-        converted = to_float(row[normalized["currency conversion"]])
-        if converted != 0:
-            return converted
         return to_float(row[normalized["total"]])
 
     for _, row in csv_df.iterrows():
@@ -138,7 +138,8 @@ def parse_trading212_transactions(csv_df):
         name = str(row[normalized["name"]]).strip()
         shares = to_float(row[normalized["no. of shares"]])
         price = to_float(row[normalized["price / share"]])
-        currency = str(row[normalized["currency"]]).strip().upper() or "USD"
+        currency_total = str(row[normalized["currency (total)"]]).strip().upper()
+        currency = currency_total or str(row[normalized["currency"]]).strip().upper() or "USD"
         amount = amount_from_row(row)
         withholding_tax = to_float(row[normalized["withholding tax"]])
 
@@ -155,7 +156,7 @@ def parse_trading212_transactions(csv_df):
                     "shares": 0.0,
                     "cost_basis": 0.0,
                     "avg_cost": 0.0,
-                    "currency": currency,
+                    "original_currency": currency,
                     "realized_gains": 0.0,
                 }
             buy_cost = abs(amount) if amount != 0 else shares * price
@@ -173,7 +174,7 @@ def parse_trading212_transactions(csv_df):
                     "shares": 0.0,
                     "cost_basis": 0.0,
                     "avg_cost": 0.0,
-                    "currency": currency,
+                    "original_currency": currency,
                     "realized_gains": 0.0,
                 }
             held_shares = records[ticker]["shares"]
@@ -210,10 +211,12 @@ def parse_trading212_transactions(csv_df):
                     "name": rec["name"],
                     "shares": rec["shares"],
                     "purchase_price": rec["avg_cost"],
-                    "purchase_currency": rec["currency"] if rec["currency"] in CURRENCIES else "USD",
+                    "purchase_currency": rec["original_currency"] if rec["original_currency"] in CURRENCIES else "USD",
                     "purchase_date": None,
                     "purchase_fx_to_usd": 1.0,
                     "cost_basis_local": rec["cost_basis"],
+                    "original_total": rec["cost_basis"],
+                    "original_currency": rec["original_currency"] if rec["original_currency"] in CURRENCIES else "USD",
                 }
             )
 
@@ -255,6 +258,29 @@ def fetch_fx_rate(base_currency, quote_currency, at_date=None):
         return to_usd * usd_to_target
 
     return None
+
+
+def parse_manual_ticker_mapping(raw_text):
+    mapping = {}
+    if not raw_text:
+        return mapping
+    parts = raw_text.replace("\n", ",").split(",")
+    for part in parts:
+        if "=" not in part:
+            continue
+        left, right = part.split("=", 1)
+        left = left.strip().upper()
+        right = right.strip().upper()
+        if left and right:
+            mapping[left] = right
+    return mapping
+
+
+def resolve_market_ticker(ticker, manual_map):
+    t = str(ticker).strip().upper()
+    if t in manual_map:
+        return manual_map[t]
+    return DEFAULT_TICKER_MAP.get(t, t)
 
 
 def fetch_stock_snapshot(ticker):
@@ -364,6 +390,8 @@ def main():
     purchase_price_input = st.sidebar.number_input("Purchase Price", min_value=0.0, value=0.0, step=1.0)
     purchase_currency_input = st.sidebar.selectbox("Purchase Currency", CURRENCIES, index=0)
     purchase_date_input = st.sidebar.date_input("Purchase Date")
+    manual_map_text = st.sidebar.text_input("Manual ticker map (e.g. HBH=HBH.PR)", value="")
+    manual_ticker_map = parse_manual_ticker_mapping(manual_map_text)
 
     if st.sidebar.button("Add Position"):
         if ticker_input.strip():
@@ -395,7 +423,8 @@ def main():
         st.info("No positions yet. Add a stock from the sidebar.")
         return
 
-    tickers = sorted(portfolio_df["ticker"].unique().tolist())
+    portfolio_df["market_ticker"] = portfolio_df["ticker"].map(lambda t: resolve_market_ticker(t, manual_ticker_map))
+    tickers = sorted(portfolio_df["market_ticker"].unique().tolist())
 
     snapshots = {}
     news_by_ticker = {}
@@ -427,17 +456,30 @@ def main():
         display_currency = "USD"
         usd_to_display = 1.0
 
-    portfolio_df["current_price"] = portfolio_df["ticker"].map(
+    portfolio_df["current_price"] = portfolio_df["market_ticker"].map(
         lambda t: snapshots.get(t, {}).get("current_price")
     )
-    portfolio_df["stock_currency"] = portfolio_df["ticker"].map(
+    portfolio_df["stock_currency"] = portfolio_df["market_ticker"].map(
         lambda t: snapshots.get(t, {}).get("stock_currency", "USD")
     )
 
-    portfolio_df["original_cost_local"] = portfolio_df["shares"] * portfolio_df["purchase_price"].fillna(0)
-    portfolio_df["original_cost_usd"] = (
-        portfolio_df["original_cost_local"] * portfolio_df["purchase_fx_to_usd"].fillna(1.0)
-    )
+    if "original_total" in portfolio_df.columns:
+        portfolio_df["original_cost_local"] = portfolio_df["original_total"].fillna(0.0)
+        portfolio_df["original_currency"] = portfolio_df["original_currency"].fillna(
+            portfolio_df["purchase_currency"]
+        )
+        portfolio_df["purchase_to_usd_now"] = portfolio_df["original_currency"].map(
+            lambda c: fetch_fx_rate(c, "USD") or 1.0
+        )
+        portfolio_df["original_cost_usd"] = (
+            portfolio_df["original_cost_local"] * portfolio_df["purchase_to_usd_now"]
+        )
+    else:
+        portfolio_df["original_cost_local"] = portfolio_df["shares"] * portfolio_df["purchase_price"].fillna(0)
+        portfolio_df["original_currency"] = portfolio_df["purchase_currency"].fillna("USD")
+        portfolio_df["original_cost_usd"] = (
+            portfolio_df["original_cost_local"] * portfolio_df["purchase_fx_to_usd"].fillna(1.0)
+        )
     portfolio_df["original_cost_display"] = portfolio_df["original_cost_usd"] * usd_to_display
 
     portfolio_df["stock_to_usd_now"] = portfolio_df["stock_currency"].map(
@@ -460,6 +502,7 @@ def main():
         st.subheader("Portfolio Table")
     table_cols = [
         "ticker",
+        "market_ticker",
         "shares",
         "purchase_price",
         "purchase_currency",
@@ -472,6 +515,26 @@ def main():
         "unrealized_gain_loss_pct",
     ]
     st.dataframe(portfolio_df[table_cols], use_container_width=True)
+
+    debug_cols = [
+        "ticker",
+        "market_ticker",
+        "shares",
+        "original_cost_local",
+        "original_currency",
+        "current_price",
+        "current_value_display",
+    ]
+    st.subheader("Debug Table")
+    debug_df = portfolio_df[debug_cols].rename(
+        columns={
+            "market_ticker": "mapped ticker",
+            "original_cost_local": "original total",
+            "original_currency": "original currency",
+            "current_value_display": f"current value ({display_currency})",
+        }
+    )
+    st.dataframe(debug_df, use_container_width=True)
 
     if imported_summary is not None:
         st.subheader("Realized gains")
